@@ -1,0 +1,386 @@
+---
+title: "HDRC_DataScientist"
+author: "Chantel Davies"
+date: "2023-12-05"
+output:
+  pdf_document: default
+---
+```{r setup, include=FALSE}
+# Load packages
+knitr::opts_chunk$set(echo = TRUE)
+library(plyr)
+library(tidyverse)
+library(reactable)
+library(gt)
+library(readr)
+library(purrr)
+library(ggplot2)
+library(sf)
+library(leaflet)
+library(htmltools)
+
+sysfonts::font_add_google("Roboto")
+```
+# Introduction
+
+The Director of Neighbourhoods wants to understand more about road traffic crashes in Bradford. You, the HDRC data scientist, have been asked to give some insight into road traffic crashes in Bradford.
+
+Therefore, your task is to:
+1) examine this Bradford road traffic crash data;
+2) identify and display insights; and
+3) give us a 10 minute presentation during your interview about the work you have done – this should include slides that showcase your work
+
+# Questions/ areas of interest
+Casualty 'hotspots'
+Volume of casualties from 2018 to 2020 - how do they compare
+Different types of casualties
+Pedestrians and cyclists
+Summary statistics (count, percentage initially)
+
+```{r load-data, include=FALSE}
+# Load crashes data
+crashes <- read_csv("./data/bfd_crashes.csv",
+                    col_names = TRUE)
+
+# For some reason, the csv files wouldn't batch read, so I did it individually
+# Subset to variables of interest
+crashes <- crashes %>% select(c("accident_index",
+                     "accident_year",
+                     "longitude",
+                     "latitude",
+                     "number_of_casualties",
+                     "date",
+                     "day_of_week",
+                     "time",
+                     "local_authority_ons_district",
+                     "road_type",
+                     "speed_limit",
+                     "pedestrian_crossing_human_control",
+                     "pedestrian_crossing_physical_facilities",
+                     "light_conditions"))
+
+# Load vehicles data
+vehicles <- read_csv("./data/bfd_vehicles.csv",
+                     col_names = TRUE)
+
+vehicles <- vehicles %>% select(c("accident_index",
+                      "vehicle_type",
+                      "sex_of_driver",
+                      "age_band_of_driver",
+                      "driver_imd_decile"))
+
+#Load casualties data
+casualties <- read_csv("./data/bfd_casualties.csv",
+                       col_names = TRUE)
+
+casualties <- casualties %>% select(c("accident_index",
+                        "casualty_class",
+                        "casualty_type",
+                        "sex_of_casualty",
+                        "age_band_of_casualty",
+                        "casualty_severity",
+                        "pedestrian_location",
+                        "casualty_imd_decile"))
+
+### Map ###
+# I'll make a map and use the following shapefile
+# https://ckan.publishing.service.gov.uk/dataset/local-authority-districts-may-2021-uk-bgc/resource/9fe4a677-79f9-4438-89e4-0f0370378ac3
+
+# Read in with sf package
+uk <- st_read(dsn = "data/Local_Authority_Districts_(May_2021)_UK_BGC/LAD_MAY_2021_UK_BGC.shp")
+```
+
+
+```{r basic-statistics, include=FALSE}
+# Left join the data to match vehicles and crashes to casualties
+bradford_rta <- join_all(list(casualties, vehicles, crashes), by='accident_index', type='left')
+
+# Focus on the Bradford area using district code E08000032, as per the assignment specification
+# Create a new 'month' column, position after the date, convert to factor and reorder the levels to chronological order
+bradford_rta <- bradford_rta %>% 
+  filter(local_authority_ons_district == "E08000032") %>% 
+  mutate(month = format(as.Date(date, format="%Y-%m-%d"),"%B"), .after = date) %>%
+  mutate(month = factor(month,
+                        levels = c("January",
+                                   "February",
+                                   "March",
+                                   "April",
+                                   "May",
+                                   "June",
+                                   "July",
+                                   "August",
+                                   "September",
+                                   "October",
+                                   "November",
+                                   "December")))
+
+
+# A little function to quickly calculate percentages from the counts of different columns, from here: https://stackoverflow.com/questions/9623763/extend-contigency-table-with-proportions-percentages
+# Useful for quickly eyeballing general counts and percentages
+
+tblFun <- function(x){
+    tbl <- table(x)
+    res <- cbind(tbl,round(prop.table(tbl)*100,2))
+    colnames(res) <- c('Count','Percentage')
+    res
+}
+
+do.call(rbind, lapply(bradford_rta[3], tblFun))
+
+#The greatest percentage of casualties overall were car occupants (67%), pedestrians (11%) and cyclists (9%) 
+
+# Tally the number of casualties for each year to compare numbers
+bradford_rta %>% 
+  group_by(accident_year) %>% 
+  summarise(total = n())
+
+# The number of casualties declined from 2,432 in 2018 to 1,754 in 2020; 2020's numbers are likely to be a result of lockdowns and fewer cars on the road.
+
+# Tally the number of casualties for each month of each year to look for any seasonal patterns and plot them on a line graph to compare
+total_casualties <- bradford_rta %>% 
+  group_by(accident_year, month) %>% 
+  count()
+
+total_casualties %>% 
+  ggplot(aes(x = month, y = n, group = accident_year, color = as.factor(accident_year), shape = as.factor(accident_year))) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 4) +
+  labs(x = "Month",
+       y = "Number of casualties") +
+  scale_shape_manual(name = "Year",
+                      values=c(15, 16, 17)) + 
+  scale_color_manual(name = "Year",
+                      values=c('#999999','#E69F00', '#56B4E9')) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 300)) +
+  theme_bw() +
+  theme(legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14),
+        axis.title = element_text(size = 16),
+        axis.text = element_text(size = 14, colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+There are casualty 'peaks' in October which is not uncommon and may be due to the switch from BST to GMT.
+
+```{r drilling-down, include=FALSE}
+# Going back to the three original datasets to produce a summary of volume and percentage of casualties and vehicle types for cyclists and pedestrians
+
+bradford_rta %>% 
+  group_by(casualty_type, vehicle_type) %>% 
+  filter(casualty_type %in% c ("Cyclist", "Pedestrian")) %>% 
+  summarise(n = n()) %>% 
+  mutate(percentage = scales::percent(n/sum(n), accuracy = 1)) %>% 
+  pivot_wider(names_from = casualty_type,
+              values_from = c(n, percentage)) %>%
+  select(vehicle_type, percentage_Cyclist, percentage_Pedestrian) %>% 
+reactable(
+    pagination = FALSE,
+    sortable = TRUE,
+    defaultColDef = colDef(
+      align = "center"
+    ),
+    columns = list(
+      vehicle_type = colDef(
+        name = "Vehicle Type",
+        align = "left"
+      ),
+      percentage_Cyclist = colDef(
+        name = "% cyclists"
+      ),
+      percentage_Pedestrian = colDef(
+        name = "% pedestrians"
+      )
+    ),
+    defaultPageSize = 13) %>% 
+  google_font(font_family = "Roboto")
+
+```
+
+85% of pedestrian casualties involve a car; 44% involve a car, but 50% involve a pedal cycle... which is sort of obvious, but may also be attributable to potholes, uneven road surfaces or other types of incidents - would be interesting to find out.
+
+Let's have a look at the categories of casualty_severity for each time period
+
+```{r further-exploration-code, include=FALSE}
+# This shows the number of casualties by severity
+# Initially I was only going to look at serious or fatal, but then went for all types as the slight casualties may lead to serious or fatal if not managed
+bradford_rta %>% 
+  #filter(casualty_severity %in% c("Serious", "Fatal")) %>% 
+  group_by(casualty_severity, casualty_type) %>% 
+  summarise(n = n()) %>% 
+  print(n = Inf)
+
+# Illustrated in a horizontal bar chart
+bradford_rta %>% 
+  #filter(casualty_severity %in% c("Serious", "Fatal")) %>% 
+  group_by(casualty_severity, casualty_type) %>% 
+  summarise(n = n()) %>% 
+  ggplot(aes(x = casualty_type, y = n)) +
+  geom_bar(stat='identity',
+           width = 0.8) +
+  geom_text(aes(label=n),
+            hjust = -0.15) +
+  coord_flip() +
+  labs(y = "Number of casualties") +
+  facet_grid(~casualty_severity) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 25)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        axis.title.x = element_text(size = 16),
+        axis.text = element_text(size = 8, colour = "black"),
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(size = 12))
+
+# Might need to zoom to get the full image
+
+# Physical activity is important, so I will narrow down the type of casualty to pedestrians and cyclists
+# Illustrated in a horizontal bar chart
+
+seriousness <- bradford_rta %>% 
+  filter(casualty_type %in% c("Cyclist", "Pedestrian")) %>% 
+  group_by(casualty_severity, casualty_type) %>% 
+  summarise(n = n())
+
+seriousness %>% 
+           ggplot(aes(x = casualty_type,
+             y = n,,
+             # fill = casualty_severity,
+             text = paste("</br>Severity: ", casualty_severity,
+                          "</br>Type: ", casualty_type,
+                          "</br>Casualties: ", n))) +
+  geom_bar(stat='identity',
+           width = 0.8) +
+  # coord_flip() +
+  labs(x = "Casualty type",
+       y = "Number of casualties") +
+  facet_grid(~casualty_severity) +
+  #scale_x_discrete(labels = function(x) str_wrap(x, width = 25)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title.y = element_text(size = 14),
+        axis.title.x = element_text(size = 14, vjust = -1),
+        axis.text = element_text(size = 8, colour = "black"),
+        strip.background = element_rect(fill = "white"),
+        strip.text = element_text(size = 14))
+```
+
+Pedestrians and cyclists are not faring too well on Bradford's roads...
+
+With the magic of {leaflet}, we can see where the hotspots occur for subgroups of pedestrians and cyclists.
+
+```{r map, include=FALSE}
+
+# Subsetting the geometry of the shapefile imported earlier
+# Filter for Bradford and removed unneeded variables
+bradford <- uk %>% 
+  filter(LAD21CD == "E08000032") %>% 
+  select(-c(OBJECTID, LAD21NM, LAD21NMW, BNG_E, BNG_N, GlobalID, LONG, LAT))
+
+# Reduce the size of the shapefile to make R less likely to crash
+bradford <- st_simplify(bradford, preserveTopology = TRUE, dTolerance = 1000)
+
+# Remove the larger shapefile
+rm(uk)
+
+# I want to show accident hotspots on the map, so I combine the accident data with the shapefile - don't have to do it this way, but it can be helfpul in the eventualty of using packages like crosstalk
+bradford_data <- left_join(bradford_rta, bradford, by = c("local_authority_ons_district" = "LAD21CD"))
+
+# Convert to sf format
+bradford_data <- st_as_sf(bradford_data)
+
+# Transform the dataframe to a geometry object with the appropriate projection
+bradford_data <- st_transform(bradford_data, '+proj=longlat +datum=WGS84')
+
+# Subset to variables and levels of interest
+bradford_mapping <- bradford_data %>% 
+  filter(casualty_type %in% c("Cyclist", "Pedestrian") & casualty_severity %in% c("Fatal", "Serious")) %>% 
+  mutate(casualty_type = factor(casualty_type))
+
+# Colour coding the points to indicate whether the casualty is a pedestrian or cyclist
+pal <- colorFactor(palette = c("darkblue", "steelblue"), domain = bradford_mapping$casualty_type)
+
+# Onto the map
+leaflet(bradford_mapping) %>% 
+   setView(lng = -1.82, lat = 53.81, zoom = 11.5) %>%
+   addProviderTiles(providers$Esri.WorldStreetMap) %>% 
+   addCircleMarkers(lng = ~longitude,
+                    lat = ~latitude,
+                    popup = ~paste("Type: ", casualty_type,
+                                   "</br>Severity: ", casualty_severity,
+                                   "</br>", month, " ", accident_year,
+                                   "</br>Speed Limit: ", speed_limit,
+                                   "</br>Crossing: ", pedestrian_crossing_physical_facilities),
+                    stroke = FALSE,
+                    fillOpacity = 0.75,
+                    color = ~pal(casualty_type),
+                    clusterOptions = markerClusterOptions(palette())) %>% 
+  addLegend(pal = pal,
+            values = ~casualty_type,
+            title = "Type of casualty (pedestrian or cyclist)",
+            opacity = 1)
+
+```
+
+
+```{r summary-table, include=FALSE}
+# This table is very useful for filtering data and learning more about what is happening to pedestrians and cyclists within the severe or fatal casualty category
+
+# Run the code and play with the table
+reactable(bradford_mapping %>% dplyr::select(accident_year, casualty_type, casualty_severity, sex_of_casualty, age_band_of_casualty, pedestrian_crossing_human_control, speed_limit),
+          height = 500,
+          highlight = TRUE,
+          wrap = TRUE,
+          sortable = TRUE,
+          resizable = TRUE,
+          searchable = FALSE,
+          groupBy = "casualty_type",
+          defaultColDef = colDef(
+            show = FALSE,
+            minWidth = 70,
+            filterable = TRUE,
+            align = "left"
+          ),
+          columns = list(
+            casualty_type = colDef(
+              show = TRUE,
+              name = "Type"
+            ),
+            accident_year = colDef(
+              show = TRUE,
+              name = "Year",
+              maxWidth = 70
+            ),
+            sex_of_casualty = colDef(
+              show = TRUE,
+              name = "Sex",
+              maxWidth = 70
+            ),
+            age_band_of_casualty = colDef(
+              show = TRUE,
+              name = "Age category",
+              maxWidth = 130,
+              align = "center"
+            ),
+            casualty_severity = colDef(
+              show = TRUE,
+              name = "Severity",
+              filterable = TRUE,
+              maxWidth = 200,
+              align = "center"
+            ),
+            pedestrian_crossing_human_control = colDef(
+              show = TRUE,
+              name = "Pedestrian crossing",
+              align="center"
+            ),
+            speed_limit = colDef(
+              show = TRUE,
+              name = "Speed limit",
+              maxWidth = 100,
+              align = "center"
+            )
+          ),
+  defaultPageSize = 13) %>% 
+  google_font(font_family = "Roboto")
+```
